@@ -48,6 +48,26 @@ dirman.create_file("my_file", "my_ws", {
 })
 ```
 
+### Generate Index Files
+`core.dirman` can automatically generate and maintain an `index.norg` file in the workspace root
+and each subdirectory, linking down the directory tree with relative links.
+
+```lua
+["core.dirman"] = {
+    config = {
+        auto_index = {
+            enabled = true,        -- Generate/update index.norg files automatically
+            update_on_save = true, -- Update on BufWritePost
+            exclude_dirs = { ".git", ".neorg" },
+            no_index_dirs = { "journal" },
+        }
+    }
+}
+```
+
+You can also manually generate or refresh indices across a workspace with:
+`:Neorg generate-indices` or `:Neorg generate-indices <workspace_name>`
+
 ## Keybinds
 
 This module exposes the following keybinds (see [`core.keybinds`](@core.keybinds) for instructions on
@@ -94,8 +114,58 @@ module.load = function()
                 args = 0,
                 name = "dirman.index",
             },
+            ["generate-indices"] = {
+                max_args = 1,
+                name = "dirman.generate-indices",
+                complete = { module.public.get_workspace_names() },
+            },
         })
     end)
+
+    local is_generating_indices = false
+    vim.api.nvim_create_autocmd("BufWritePost", {
+        pattern = "*.norg",
+        callback = function(ev)
+            if is_generating_indices then
+                return
+            end
+
+            local auto_index = module.config.public.auto_index
+            if not auto_index or not auto_index.enabled or not auto_index.update_on_save then
+                return
+            end
+
+            local file_path = ev.file or vim.api.nvim_buf_get_name(ev.buf)
+            if not file_path or file_path == "" or vim.startswith(file_path, "neorg://") then
+                return
+            end
+
+            local file = Path(file_path):resolve():to_absolute()
+            local target_ws = nil
+            for ws_name, ws_path in pairs(module.config.public.workspaces) do
+                if ws_name ~= "default" and file:is_relative_to(ws_path) then
+                    target_ws = ws_name
+                    break
+                end
+            end
+
+            if not target_ws then
+                local def_ws = module.config.public.workspaces["default"]
+                if def_ws and file:is_relative_to(def_ws) then
+                    target_ws = "default"
+                end
+            end
+
+            if target_ws then
+                is_generating_indices = true
+                pcall(function()
+                    module.public.generate_indices(target_ws)
+                end)
+                is_generating_indices = false
+            end
+        end,
+        desc = "Auto-generate Neorg index files in subdirectories on save",
+    })
 
     -- Synchronize core.neorgcmd autocompletions
     module.public.sync()
@@ -145,6 +215,19 @@ module.config.public = {
     -- Whether to use core.ui.text_popup for `dirman.new.note` event.
     -- if `false`, will use vim's default `vim.ui.input` instead.
     use_popup = true,
+    -- Options for automatically creating and updating index.norg files in workspaces and subdirectories
+    auto_index = {
+        -- Enable automatic generation of index.norg in workspaces and subdirectories
+        enabled = true,
+        -- Update indices automatically when saving a .norg file
+        update_on_save = true,
+        -- Directories to completely exclude from indexing
+        exclude_dirs = { ".git", ".neorg" },
+        -- Directories not to auto-generate index files in (linked from parent if present)
+        no_index_dirs = { "journal" },
+        -- Custom heading formatting function: fun(dir_path: PathlibPath, ws_root: PathlibPath, is_root: boolean): string?
+        format_heading = nil,
+    },
 }
 
 module.private = {
@@ -299,8 +382,82 @@ module.public = {
                     name = "dirman.workspace",
                     complete = { workspace_names },
                 },
+                ["generate-indices"] = {
+                    max_args = 1,
+                    name = "dirman.generate-indices",
+                    complete = { workspace_names },
+                },
             })
         end)
+    end,
+
+    --- Generates index.norg files for a workspace and all subdirectories
+    ---@param workspace? string|PathlibPath workspace name or path (defaults to current workspace)
+    ---@param opts? table options to override auto_index config
+    ---@return number? count of modified index files, or nil on error
+    generate_indices = function(workspace, opts)
+        local base_opts = vim.tbl_deep_extend("force", {
+            index = module.public.get_index(),
+        }, module.config.public.auto_index or {})
+        opts = vim.tbl_deep_extend("force", base_opts, opts or {})
+
+        local ws_root
+        local ws_name
+        if not workspace then
+            local curr = module.public.get_current_workspace()
+            ws_name = curr[1]
+            ws_root = curr[2]
+        elseif type(workspace) == "string" and module.config.public.workspaces[workspace] then
+            ws_name = workspace
+            ws_root = module.config.public.workspaces[workspace]
+        else
+            ws_root = Path(workspace):resolve():to_absolute()
+            ws_name = tostring(workspace)
+        end
+
+        if not ws_root or not ws_root:exists() then
+            log.warn("Unable to generate indices: workspace path does not exist (" .. tostring(ws_root) .. ")")
+            return nil
+        end
+
+        local updated_count, all_dirs = dirman_utils.generate_all_indices(ws_root, opts)
+
+        modules.broadcast_event(
+            assert(
+                modules.create_event(module, "core.dirman.events.indices_generated", {
+                    workspace = ws_name,
+                    workspace_path = ws_root,
+                    directories = all_dirs,
+                    updated_count = updated_count,
+                })
+            )
+        )
+
+        return updated_count
+    end,
+
+    --- Generates index.norg file for a specific directory
+    ---@param dir_path string|PathlibPath directory path
+    ---@param workspace? string|PathlibPath workspace name or path (defaults to current workspace)
+    ---@param opts? table options to override auto_index config
+    ---@return boolean was_modified
+    generate_index_for_dir = function(dir_path, workspace, opts)
+        local base_opts = vim.tbl_deep_extend("force", {
+            index = module.public.get_index(),
+        }, module.config.public.auto_index or {})
+        opts = vim.tbl_deep_extend("force", base_opts, opts or {})
+
+        local ws_root
+        if not workspace then
+            ws_root = module.public.get_current_workspace()[2]
+        elseif type(workspace) == "string" and module.config.public.workspaces[workspace] then
+            ws_root = module.config.public.workspaces[workspace]
+        else
+            ws_root = Path(workspace):resolve():to_absolute()
+        end
+
+        local dir = Path(dir_path):resolve():to_absolute()
+        return dirman_utils.generate_index_for_dir(dir, ws_root, opts)
     end,
 
     ---@class core.dirman.create_file_opts
@@ -560,6 +717,23 @@ module.on_event = function(event)
         dirman_utils.edit_file(index_path:cmd_string())
         return
     end
+
+    -- If somebody has executed the :Neorg generate-indices command then
+    if event.type == "core.neorgcmd.events.dirman.generate-indices" then
+        local ws_name = event.content[1]
+        local count = module.public.generate_indices(ws_name)
+        if count then
+            utils.notify("Generated/updated " .. count .. " index file(s)")
+        end
+        return
+    end
+
+    if event.type == "core.dirman.events.file_created" then
+        if module.config.public.auto_index and module.config.public.auto_index.enabled then
+            local current_ws = module.public.get_current_workspace()[1]
+            module.public.generate_indices(current_ws)
+        end
+    end
 end
 
 module.events.defined = {
@@ -567,6 +741,7 @@ module.events.defined = {
     workspace_added = modules.define_event(module, "workspace_added"),
     workspace_cache_empty = modules.define_event(module, "workspace_cache_empty"),
     file_created = modules.define_event(module, "file_created"),
+    indices_generated = modules.define_event(module, "indices_generated"),
 }
 
 module.events.subscribed = {
@@ -575,10 +750,12 @@ module.events.subscribed = {
     },
     ["core.dirman"] = {
         workspace_changed = true,
+        file_created = true,
     },
     ["core.neorgcmd"] = {
         ["dirman.workspace"] = true,
         ["dirman.index"] = true,
+        ["dirman.generate-indices"] = true,
     },
 }
 
