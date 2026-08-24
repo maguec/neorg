@@ -463,6 +463,185 @@ module.public = {
         local index_file = dir_path / index_name
         return module.public.write_index_file(index_file, lines)
     end,
+
+    --- Expands ~ or environment variables in a path to an absolute PathlibPath
+    ---@param path string|PathlibPath?
+    ---@return PathlibPath?
+    expand_tilde = function(path)
+        if not path then
+            return nil
+        end
+        local path_str = tostring(path)
+        if vim.startswith(path_str, "~") then
+            local home = vim.loop.os_homedir() or vim.fn.expand("~")
+            path_str = path_str:gsub("^~", home)
+        end
+        return Path(path_str):resolve():to_absolute()
+    end,
+
+    --- Recursively gets all subdirectories under root_dir (including root_dir itself)
+    ---@param root_dir PathlibPath
+    ---@param exclude_dirs string[]?
+    ---@return PathlibPath[]
+    get_subdirectories = function(root_dir, exclude_dirs)
+        local ex_set = {}
+        for _, ex in ipairs(exclude_dirs or { ".git", ".neorg" }) do
+            ex_set[ex] = true
+        end
+
+        local dirs = { root_dir }
+
+        local function traverse(curr)
+            local ok, iter = pcall(vim.fs.dir, curr:tostring())
+            if not ok or not iter then
+                return
+            end
+
+            local subs = {}
+            for name, type in iter do
+                if type == "directory" and not ex_set[name] and not vim.startswith(name, ".") then
+                    local full = curr / name
+                    table.insert(subs, full)
+                end
+            end
+
+            table.sort(subs, function(a, b)
+                return a:tostring():lower() < b:tostring():lower()
+            end)
+
+            for _, s in ipairs(subs) do
+                table.insert(dirs, s)
+                traverse(s)
+            end
+        end
+
+        traverse(root_dir)
+        return dirs
+    end,
+
+    --- Prompts the user to pick a directory using fzf-lua, telescope, or vim.ui.select
+    ---@param dir_list PathlibPath[]
+    ---@param root_dir PathlibPath
+    ---@param opts table?
+    ---@param callback fun(chosen_dir: PathlibPath)
+    pick_directory = function(dir_list, root_dir, opts, callback)
+        opts = opts or {}
+        local picker_pref = opts.picker or "auto"
+        local prompt_text = opts.prompt or "Select directory for dated note: "
+
+        local entries = {}
+        local entry_to_dir = {}
+        for _, d in ipairs(dir_list) do
+            local display = (d:tostring() == root_dir:tostring()) and "." or d:relative_to(root_dir):tostring("/")
+            table.insert(entries, display)
+            entry_to_dir[display] = d
+        end
+
+        -- 1. Try fzf-lua if requested or auto
+        if picker_pref == "fzf-lua" or picker_pref == "auto" then
+            local fzf_ok, fzf = pcall(require, "fzf-lua")
+            if fzf_ok and fzf.fzf_exec then
+                fzf.fzf_exec(entries, {
+                    prompt = prompt_text,
+                    actions = {
+                        ["default"] = function(selected)
+                            if selected and #selected > 0 then
+                                local choice = selected[1]
+                                local chosen = entry_to_dir[choice] or (root_dir / choice)
+                                callback(chosen)
+                            end
+                        end,
+                    },
+                })
+                return
+            end
+        end
+
+        -- 2. Try telescope if requested or auto
+        if picker_pref == "telescope" or picker_pref == "auto" then
+            local tele_ok, pickers = pcall(require, "telescope.pickers")
+            local finders_ok, finders = pcall(require, "telescope.finders")
+            local conf_ok, conf = pcall(require, "telescope.config")
+            local actions_ok, actions = pcall(require, "telescope.actions")
+            local action_state_ok, action_state = pcall(require, "telescope.actions.state")
+
+            if tele_ok and finders_ok and actions_ok and action_state_ok then
+                pickers
+                    .new({}, {
+                        prompt_title = prompt_text,
+                        finder = finders.new_table({
+                            results = entries,
+                        }),
+                        sorter = conf_ok and conf.values.generic_sorter({}) or nil,
+                        attach_mappings = function(prompt_bufnr)
+                            actions.select_default:replace(function()
+                                actions.close(prompt_bufnr)
+                                local selection = action_state.get_selected_entry()
+                                if selection then
+                                    local choice = selection[1] or selection.value
+                                    local chosen = entry_to_dir[choice] or (root_dir / choice)
+                                    callback(chosen)
+                                end
+                            end)
+                            return true
+                        end,
+                    })
+                    :find()
+                return
+            end
+        end
+
+        -- 3. Fallback to standard vim.ui.select
+        vim.ui.select(entries, {
+            prompt = prompt_text,
+            format_item = function(item)
+                return item == "." and ". (Root: " .. vim.fs.basename(root_dir:tostring()) .. ")" or item
+            end,
+        }, function(choice)
+            if choice then
+                local chosen = entry_to_dir[choice] or (root_dir / choice)
+                callback(chosen)
+            end
+        end)
+    end,
+
+    --- Creates and opens a dated .norg file inside dir_path
+    ---@param dir_path PathlibPath
+    ---@param opts table?
+    ---@return PathlibPath note_file, boolean is_new
+    create_dated_note = function(dir_path, opts)
+        opts = opts or {}
+        local date_format = opts.date_format or "%Y-%m-%d"
+        local date_str = vim.fn.strftime(date_format)
+        local extension = opts.extension or ".norg"
+        if not vim.startswith(extension, ".") then
+            extension = "." .. extension
+        end
+
+        local filename = date_str .. extension
+        local note_file = dir_path / filename
+
+        -- Ensure directory exists
+        dir_path:mkdir(Path.const.o755 + 4 * math.pow(8, 4), true)
+
+        local is_new = not note_file:exists()
+        if is_new then
+            local fd = note_file:fs_open("a", Path.const.o644, false)
+            if fd then
+                vim.loop.fs_close(fd)
+            end
+        end
+
+        if opts.chdir then
+            pcall(vim.loop.chdir, dir_path:tostring())
+        end
+
+        if not opts.no_open then
+            module.public.edit_file(note_file)
+        end
+
+        return note_file, is_new
+    end,
 }
 
 return module

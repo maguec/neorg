@@ -2,10 +2,26 @@ local tests = require("neorg.tests")
 local Path = require("pathlib")
 
 describe("core.dirman tests", function()
+    local ws_idx_path = Path.cwd() / "test-workspace-index"
+    local ws_dated_path = Path.cwd() / "test-workspace-dated"
+
     local dirman = tests
         .neorg_with("core.dirman", {
             workspaces = {
                 test = "./test-workspace",
+                idx_test = ws_idx_path:tostring(),
+                dated_test = ws_dated_path:tostring(),
+            },
+            auto_index = {
+                enabled = true,
+                update_on_save = true,
+                no_index_dirs = { "journal" },
+            },
+            dated_note = {
+                root_dir = "Customers",
+                date_format = "%Y-%m-%d",
+                extension = ".norg",
+                chdir = false,
             },
         }).modules
         .get_module("core.dirman")
@@ -15,6 +31,8 @@ describe("core.dirman tests", function()
             assert.same(dirman.get_workspaces(), {
                 default = Path.cwd(),
                 test = Path.cwd() / "test-workspace",
+                idx_test = ws_idx_path,
+                dated_test = ws_dated_path,
             })
         end)
 
@@ -40,43 +58,28 @@ describe("core.dirman tests", function()
     end)
 
     describe("auto_index and index generation", function()
-        local ws_path = Path.cwd() / "test-workspace-index"
-
         after_each(function()
-            vim.fn.delete(ws_path:tostring(), "rf")
+            vim.fn.delete(ws_idx_path:tostring(), "rf")
         end)
 
         it("generates directory-only tree in root and 1-level index in subdirectories", function()
-            local dirman_module = tests
-                .neorg_with("core.dirman", {
-                    workspaces = {
-                        idx_test = ws_path:tostring(),
-                    },
-                    auto_index = {
-                        enabled = true,
-                        update_on_save = true,
-                        no_index_dirs = { "journal" },
-                    },
-                }).modules
-                .get_module("core.dirman")
-
-            dirman_module.set_workspace("idx_test")
+            dirman.set_workspace("idx_test")
 
             -- Create nested file structure including journal
-            dirman_module.create_file("root-note", "idx_test", { no_open = true })
-            dirman_module.create_file("sub/nested-note", "idx_test", { no_open = true })
-            dirman_module.create_file("sub/deep/deep-note", "idx_test", { no_open = true })
-            dirman_module.create_file("journal/2026/08/21", "idx_test", { no_open = true })
+            dirman.create_file("root-note", "idx_test", { no_open = true })
+            dirman.create_file("sub/nested-note", "idx_test", { no_open = true })
+            dirman.create_file("sub/deep/deep-note", "idx_test", { no_open = true })
+            dirman.create_file("journal/2026/08/21", "idx_test", { no_open = true })
 
-            assert.equal(vim.fn.filereadable((ws_path / "index.norg"):tostring()), 1)
-            assert.equal(vim.fn.filereadable((ws_path / "sub" / "index.norg"):tostring()), 1)
-            assert.equal(vim.fn.filereadable((ws_path / "sub" / "deep" / "index.norg"):tostring()), 1)
+            assert.equal(vim.fn.filereadable((ws_idx_path / "index.norg"):tostring()), 1)
+            assert.equal(vim.fn.filereadable((ws_idx_path / "sub" / "index.norg"):tostring()), 1)
+            assert.equal(vim.fn.filereadable((ws_idx_path / "sub" / "deep" / "index.norg"):tostring()), 1)
             -- journal subdirectories should NOT have auto-generated indices
-            assert.equal(vim.fn.filereadable((ws_path / "journal" / "index.norg"):tostring()), 0)
-            assert.equal(vim.fn.filereadable((ws_path / "journal" / "2026" / "index.norg"):tostring()), 0)
+            assert.equal(vim.fn.filereadable((ws_idx_path / "journal" / "index.norg"):tostring()), 0)
+            assert.equal(vim.fn.filereadable((ws_idx_path / "journal" / "2026" / "index.norg"):tostring()), 0)
 
             -- Check root index.norg: has root-note and subdirectories down to index.norg, but NOT leaf notes of subdirectories
-            local root_idx = ws_path / "index.norg"
+            local root_idx = ws_idx_path / "index.norg"
             local rf = io.open(root_idx:tostring(), "r")
             assert.is_not_nil(rf)
             local root_content = rf:read("*a")
@@ -91,7 +94,7 @@ describe("core.dirman tests", function()
             assert.is_falsy(root_content:find("2026"))
 
             -- Check sub/index.norg content: has direct note and 1 level down to deep/index
-            local sub_idx = ws_path / "sub" / "index.norg"
+            local sub_idx = ws_idx_path / "sub" / "index.norg"
             local sf = io.open(sub_idx:tostring(), "r")
             assert.is_not_nil(sf)
             local sub_content = sf:read("*a")
@@ -104,7 +107,7 @@ describe("core.dirman tests", function()
             assert.is_falsy(sub_content:find("deep%-note"))
 
             -- Check sub/deep/index.norg content: has direct note deep-note
-            local deep_idx = ws_path / "sub" / "deep" / "index.norg"
+            local deep_idx = ws_idx_path / "sub" / "deep" / "index.norg"
             local df = io.open(deep_idx:tostring(), "r")
             assert.is_not_nil(df)
             local deep_content = df:read("*a")
@@ -112,6 +115,25 @@ describe("core.dirman tests", function()
 
             assert.is_truthy(deep_content:find("%* Index of sub/deep"))
             assert.is_truthy(deep_content:find("%- {:deep%-note:}%[deep%-note%]"))
+        end)
+    end)
+
+    describe("dated_note functionality", function()
+        after_each(function()
+            vim.fn.delete(ws_dated_path:tostring(), "rf")
+        end)
+
+        it("creates a dated note in a selected directory with configurable root_dir", function()
+            dirman.set_workspace("dated_test")
+
+            local target_sub = ws_dated_path / "Customers" / "AcmeCorp"
+            local note_file, is_new = dirman.create_dated_note(target_sub, { no_open = true })
+
+            assert.is_true(is_new)
+            assert.is_true(note_file:exists())
+
+            local today = vim.fn.strftime("%Y-%m-%d")
+            assert.equal(note_file:tostring(), (target_sub / (today .. ".norg")):tostring())
         end)
     end)
 end)

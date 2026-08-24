@@ -60,7 +60,14 @@ and each subdirectory, linking down the directory tree with relative links.
             update_on_save = true, -- Update on BufWritePost
             exclude_dirs = { ".git", ".neorg" },
             no_index_dirs = { "journal" },
-        }
+        },
+        dated_note = {
+            root_dir = "Customers", -- Directory under which to pick subdirectories (nil = workspace root)
+            date_format = "%Y-%m-%d", -- Format for strftime
+            extension = ".norg",
+            chdir = false,
+            picker = "auto", -- "auto" | "fzf-lua" | "telescope" | "select"
+        },
     }
 }
 ```
@@ -68,12 +75,17 @@ and each subdirectory, linking down the directory tree with relative links.
 You can also manually generate or refresh indices across a workspace with:
 `:Neorg generate-indices` or `:Neorg generate-indices <workspace_name>`
 
+### Create a Dated Note
+You can create a dated note (e.g. `YYYY-MM-DD.norg`) inside a selected subdirectory:
+`:Neorg dated-note` or `:Neorg dated-note <workspace_name>`
+
 ## Keybinds
 
 This module exposes the following keybinds (see [`core.keybinds`](@core.keybinds) for instructions on
 mapping them):
 
 - `neorg.dirman.new-note` - Create a new note in the current workspace, prompt for name
+- `neorg.dirman.new-dated-note` - Create a new dated note (YYYY-MM-DD.norg) in a selected subdirectory
 
 --]]
 
@@ -104,6 +116,8 @@ module.load = function()
     ui = module.required["core.ui"]
 
     vim.keymap.set("", "<Plug>(neorg.dirman.new-note)", module.public.new_note)
+    vim.keymap.set("", "<Plug>(neorg.dirman.new-dated-note)", module.public.dated_note)
+    vim.keymap.set("", "<Plug>(neorg.dirman.dated-note)", module.public.dated_note)
 
     -- Used to detect when we've entered a buffer with a potentially different cwd
     module.required["core.autocommands"].enable_autocommand("BufEnter", true)
@@ -117,6 +131,11 @@ module.load = function()
             ["generate-indices"] = {
                 max_args = 1,
                 name = "dirman.generate-indices",
+                complete = { module.public.get_workspace_names() },
+            },
+            ["dated-note"] = {
+                max_args = 1,
+                name = "dirman.dated-note",
                 complete = { module.public.get_workspace_names() },
             },
         })
@@ -227,6 +246,26 @@ module.config.public = {
         no_index_dirs = { "journal" },
         -- Custom heading formatting function: fun(dir_path: PathlibPath, ws_root: PathlibPath, is_root: boolean): string?
         format_heading = nil,
+    },
+    -- Configuration for dated notes (creating YYYY-MM-DD.norg inside a selected subdirectory)
+    dated_note = {
+        -- Root directory under which to select directories for dated notes.
+        -- Can be:
+        --   - a relative path inside the workspace (e.g. "Customers" or "diary")
+        --   - an absolute path string (e.g. "~/Code/Google/AITools/Neorg/MyNeorg/neorg/Customers")
+        --   - a function returning string|PathlibPath: fun(ws_root: PathlibPath): string|PathlibPath
+        --   - nil (uses current workspace root)
+        root_dir = nil,
+        -- Date format string for strftime (e.g. "%Y-%m-%d")
+        date_format = "%Y-%m-%d",
+        -- File extension (default: ".norg")
+        extension = ".norg",
+        -- Whether to change working directory (chdir) to the chosen directory upon note creation
+        chdir = false,
+        -- Directories to exclude when scanning directory tree
+        exclude_dirs = { ".git", ".neorg" },
+        -- Preferred picker: "auto" (tries fzf-lua, telescope, falls back to select), "fzf-lua", "telescope", "select"
+        picker = "auto",
     },
 }
 
@@ -385,6 +424,11 @@ module.public = {
                 ["generate-indices"] = {
                     max_args = 1,
                     name = "dirman.generate-indices",
+                    complete = { workspace_names },
+                },
+                ["dated-note"] = {
+                    max_args = 1,
+                    name = "dirman.dated-note",
                     complete = { workspace_names },
                 },
             })
@@ -658,6 +702,88 @@ module.public = {
         end
         return not not file:match("^" .. ws_path)
     end,
+
+    --- Interactive picker to create a dated note (YYYY-MM-DD.norg) in a selected subdirectory
+    ---@param opts? table options overriding dated_note config { root_dir, workspace, date_format, extension, chdir, picker }
+    dated_note = function(opts)
+        opts = opts or {}
+        local base_opts = module.config.public.dated_note or {}
+        local merged_opts = vim.tbl_deep_extend("force", base_opts, opts)
+
+        local ws_root
+        local ws_name
+        if opts.workspace then
+            ws_name = opts.workspace
+            ws_root = module.public.get_workspace(opts.workspace)
+        else
+            local curr = module.public.get_current_workspace()
+            ws_name = curr[1]
+            ws_root = curr[2]
+        end
+
+        if not ws_root then
+            log.error("Unable to create dated note: could not determine workspace root.")
+            return
+        end
+
+        local root_setting = merged_opts.root_dir
+        local resolved_root
+        if type(root_setting) == "function" then
+            local res = root_setting(ws_root)
+            resolved_root = dirman_utils.expand_tilde(res)
+        elseif type(root_setting) == "string" and root_setting ~= "" then
+            if vim.startswith(root_setting, "~") or vim.startswith(root_setting, "/") then
+                resolved_root = dirman_utils.expand_tilde(root_setting)
+            else
+                resolved_root = (ws_root / root_setting):resolve():to_absolute()
+            end
+        else
+            resolved_root = ws_root
+        end
+
+        if not resolved_root:exists() then
+            resolved_root:mkdir(Path.const.o755 + 4 * math.pow(8, 4), true)
+        end
+
+        if opts.directory then
+            local target_dir = dirman_utils.expand_tilde(opts.directory)
+            return module.public.create_dated_note(target_dir, merged_opts)
+        end
+
+        local dirs = dirman_utils.get_subdirectories(resolved_root, merged_opts.exclude_dirs)
+
+        dirman_utils.pick_directory(dirs, resolved_root, merged_opts, function(chosen_dir)
+            module.public.create_dated_note(chosen_dir, merged_opts)
+        end)
+    end,
+
+    --- Creates and opens a dated note inside a specific directory
+    ---@param dir_path string|PathlibPath
+    ---@param opts? table
+    ---@return PathlibPath note_file, boolean is_new
+    create_dated_note = function(dir_path, opts)
+        opts = opts or {}
+        local base_opts = module.config.public.dated_note or {}
+        local merged_opts = vim.tbl_deep_extend("force", base_opts, opts)
+
+        local dir = dirman_utils.expand_tilde(dir_path)
+        local note_file, is_new = dirman_utils.create_dated_note(dir, merged_opts)
+
+        if is_new then
+            local bufnr = vim.api.nvim_get_current_buf()
+            modules.broadcast_event(
+                assert(
+                    modules.create_event(
+                        module,
+                        "core.dirman.events.file_created",
+                        { buffer = bufnr, opts = merged_opts }
+                    )
+                )
+            )
+        end
+
+        return note_file, is_new
+    end,
 }
 
 module.on_event = function(event)
@@ -728,6 +854,13 @@ module.on_event = function(event)
         return
     end
 
+    -- If somebody has executed the :Neorg dated-note command then
+    if event.type == "core.neorgcmd.events.dirman.dated-note" then
+        local ws_name = event.content[1]
+        module.public.dated_note({ workspace = ws_name })
+        return
+    end
+
     if event.type == "core.dirman.events.file_created" then
         if module.config.public.auto_index and module.config.public.auto_index.enabled then
             local current_ws = module.public.get_current_workspace()[1]
@@ -756,6 +889,7 @@ module.events.subscribed = {
         ["dirman.workspace"] = true,
         ["dirman.index"] = true,
         ["dirman.generate-indices"] = true,
+        ["dirman.dated-note"] = true,
     },
 }
 
