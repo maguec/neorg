@@ -332,21 +332,21 @@ module.public = {
 
         if is_root then
             -- Root index:
-            -- 1. Direct files at the root level
+            -- 1. Direct files at the root level (prefixed by **)
             local direct_files = get_direct_files(dir_path)
             for _, f in ipairs(direct_files) do
                 local rel = f:relative_to(dir_path):tostring("/"):gsub("%.norg$", "")
                 local title = module.public.get_file_title(f)
-                table.insert(lines, "- {:" .. rel .. ":}[" .. title .. "]")
+                table.insert(lines, "** {:" .. rel .. ":}[" .. title .. "]")
             end
 
-            -- 2. Recursive directory tree linking to index.norg files only
+            -- 2. Recursive directory tree linking to index.norg files only (depth 1 starts with **, then ***, etc.)
             local function render_root_tree(curr_dir, depth)
                 local subdirs = get_direct_subdirs(curr_dir)
                 for _, s in ipairs(subdirs) do
                     local s_name = vim.fs.basename(s:tostring())
                     local rel_index = s:relative_to(dir_path):tostring("/") .. "/" .. index_base
-                    local prefix = string.rep("-", depth) .. " "
+                    local prefix = string.rep("*", depth + 1) .. " "
                     table.insert(lines, prefix .. "{:" .. rel_index .. ":}[" .. s_name .. "]")
 
                     if not no_index_set[s_name] then
@@ -358,20 +358,20 @@ module.public = {
             render_root_tree(dir_path, 1)
         else
             -- Subdirectory index:
-            -- 1. Direct files in this directory
+            -- 1. Direct files in this directory (prefixed by **)
             local direct_files = get_direct_files(dir_path)
             for _, f in ipairs(direct_files) do
                 local rel = f:relative_to(dir_path):tostring("/"):gsub("%.norg$", "")
                 local title = module.public.get_file_title(f)
-                table.insert(lines, "- {:" .. rel .. ":}[" .. title .. "]")
+                table.insert(lines, "** {:" .. rel .. ":}[" .. title .. "]")
             end
 
-            -- 2. Down 1 level to direct subdirectories' index.norg
+            -- 2. Down 1 level to direct subdirectories' index.norg (prefixed by ***)
             local direct_subdirs = get_direct_subdirs(dir_path)
             for _, s in ipairs(direct_subdirs) do
                 local s_name = vim.fs.basename(s:tostring())
                 local rel_index = s_name .. "/" .. index_base
-                table.insert(lines, "- {:" .. rel_index .. ":}[" .. s_name .. "]")
+                table.insert(lines, "*** {:" .. rel_index .. ":}[" .. s_name .. "]")
             end
         end
 
